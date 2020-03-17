@@ -1202,6 +1202,8 @@ struct redisServer {
     char *rdb_filename;             /* Name of RDB file */
     int rdb_compression;            /* Use compression in RDB? */
     int rdb_checksum;               /* Use RDB checksum? */
+    int rdb_del_sync_files;         /* Remove RDB files used only for SYNC if
+                                       the instance does not use persistence. */
     time_t lastsave;                /* Unix time of last successful save */
     time_t lastbgsave_try;          /* Unix time of last attempted bgsave */
     time_t rdb_save_time_last;      /* Time used by last RDB save run. */
@@ -1393,6 +1395,9 @@ struct redisServer {
     /* ACLs */
     char *acl_filename;     /* ACL Users file. NULL if not configured. */
     unsigned long acllog_max_len; /* Maximum length of the ACL LOG list. */
+    sds requirepass;        /* Remember the cleartext password set with the
+                               old "requirepass" directive for backward
+                               compatibility with Redis <= 5. */
     /* Assert & bug reporting */
     const char *assert_failed;
     const char *assert_file;
@@ -1786,6 +1791,7 @@ void loadingProgress(off_t pos);
 void stopLoading(int success);
 void startSaving(int rdbflags);
 void stopSaving(int success);
+int allPersistenceDisabled(void);
 
 #define DISK_ERROR_TYPE_AOF 1       /* Don't accept writes: AOF errors. */
 #define DISK_ERROR_TYPE_RDB 2       /* Don't accept writes: RDB errors. */
