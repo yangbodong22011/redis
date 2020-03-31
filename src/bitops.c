@@ -902,6 +902,9 @@ void bitposCommand(client *c) {
  * OVERFLOW [WRAP|SAT|FAIL]
  */
 
+#define BITFIELD_FLAG_NONE      0
+#define BITFIELD_FLAG_READONLY  (1<<0)
+
 struct bitfieldOp {
     uint64_t offset;    /* Bitfield offset. */
     int64_t i64;        /* Increment amount (INCRBY) or SET value */
@@ -911,7 +914,10 @@ struct bitfieldOp {
     int sign;           /* True if signed, otherwise unsigned op. */
 };
 
-void bitfieldCommand(client *c) {
+/* This implements both the BITFIELD command and the BITFIELD_RO command
+ * when flags is set to BITFIELD_FLAG_READONLY: in this case only the
+ * GET subcommand is allowed, other subcommands will return an error. */
+void bitfieldGeneric(client *c, int flags) {
     robj *o;
     size_t bitoffset;
     int j, numops = 0, changes = 0;
@@ -999,6 +1005,12 @@ void bitfieldCommand(client *c) {
             return;
         }
     } else {
+        if (flags & BITFIELD_FLAG_READONLY) {
+            zfree(ops);
+            addReplyError(c, "BITFIELD_RO only supports the GET subcommand");
+            return;
+        }
+
         /* Lookup by making room up to the farest bit reached by
          * this operation. */
         if ((o = lookupStringForBitCommand(c,
@@ -1128,4 +1140,12 @@ void bitfieldCommand(client *c) {
         server.dirty += changes;
     }
     zfree(ops);
+}
+
+void bitfieldCommand(client *c) {
+    bitfieldGeneric(c, BITFIELD_FLAG_NONE);
+}
+
+void bitfieldroCommand(client *c) {
+    bitfieldGeneric(c, BITFIELD_FLAG_READONLY);
 }

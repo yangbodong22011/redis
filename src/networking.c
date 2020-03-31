@@ -124,7 +124,8 @@ client *createClient(connection *conn) {
     c->ctime = c->lastinteraction = server.unixtime;
     /* If the default user does not require authentication, the user is
      * directly authenticated. */
-    c->authenticated = (c->user->flags & USER_FLAG_NOPASS) != 0;
+    c->authenticated = (c->user->flags & USER_FLAG_NOPASS) &&
+                       !(c->user->flags & USER_FLAG_DISABLED);
     c->replstate = REPL_STATE_NONE;
     c->repl_put_online_on_ack = 0;
     c->reploff = 0;
@@ -785,7 +786,7 @@ void clientAcceptHandler(connection *conn) {
         serverLog(LL_WARNING,
                 "Error accepting a client connection: %s",
                 connGetLastError(conn));
-        freeClient(c);
+        freeClientAsync(c);
         return;
     }
 
@@ -827,7 +828,7 @@ void clientAcceptHandler(connection *conn) {
                 /* Nothing to do, Just to avoid the warning... */
             }
             server.stat_rejected_conn++;
-            freeClient(c);
+            freeClientAsync(c);
             return;
         }
     }
@@ -886,9 +887,10 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
      */
     if (connAccept(conn, clientAcceptHandler) == C_ERR) {
         char conninfo[100];
-        serverLog(LL_WARNING,
-                "Error accepting a client connection: %s (conn: %s)",
-                connGetLastError(conn), connGetInfo(conn, conninfo, sizeof(conninfo)));
+        if (connGetState(conn) == CONN_STATE_ERROR)
+            serverLog(LL_WARNING,
+                    "Error accepting a client connection: %s (conn: %s)",
+                    connGetLastError(conn), connGetInfo(conn, conninfo, sizeof(conninfo)));
         freeClient(connGetPrivateData(conn));
         return;
     }
