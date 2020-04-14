@@ -182,9 +182,28 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
 
     serverAssertWithInfo(NULL,key,retval == DICT_OK);
     if (val->type == OBJ_LIST ||
-        val->type == OBJ_ZSET)
+        val->type == OBJ_ZSET ||
+        val->type == OBJ_STREAM)
         signalKeyAsReady(db, key);
+    if (server.cluster_enabled) slotToKeyAdd(key->ptr);
+}
+
+/* This is a special version of dbAdd() that is used only when loading
+ * keys from the RDB file: the key is passed as an SDS string that is
+ * retained by the function (and not freed by the caller).
+ *
+ * Moreover this function will not abort if the key is already busy, to
+ * give more control to the caller, nor will signal the key as ready
+ * since it is not useful in this context.
+ *
+ * The function returns 1 if the key was added to the database, taking
+ * ownership of the SDS string, otherwise 0 is returned, and is up to the
+ * caller to free the SDS string. */
+int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
+    int retval = dictAdd(db->dict, key, val);
+    if (retval != DICT_OK) return 0;
     if (server.cluster_enabled) slotToKeyAdd(key);
+    return 1;
 }
 
 /* Overwrite an existing key with a new value. Incrementing the reference
@@ -220,7 +239,7 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
  *    unless 'keepttl' is true.
  *
  * All the new keys in the database should be created via this interface. */
-void genericSetKey(redisDb *db, robj *key, robj *val, int keepttl) {
+void genericSetKey(redisDb *db, robj *key, robj *val, int keepttl, int signal) {
     if (lookupKeyWrite(db,key) == NULL) {
         dbAdd(db,key,val);
     } else {
@@ -228,12 +247,12 @@ void genericSetKey(redisDb *db, robj *key, robj *val, int keepttl) {
     }
     incrRefCount(val);
     if (!keepttl) removeExpire(db,key);
-    signalModifiedKey(db,key);
+    if (signal) signalModifiedKey(db,key);
 }
 
 /* Common case for genericSetKey() where the TTL is not retained. */
 void setKey(redisDb *db, robj *key, robj *val) {
-    genericSetKey(db,key,val,0);
+    genericSetKey(db,key,val,0,1);
 }
 
 /* Return true if the specified key exists in the specified database.
@@ -287,7 +306,7 @@ int dbSyncDelete(redisDb *db, robj *key) {
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
     if (dictDelete(db->dict,key->ptr) == DICT_OK) {
-        if (server.cluster_enabled) slotToKeyDel(key);
+        if (server.cluster_enabled) slotToKeyDel(key->ptr);
         return 1;
     } else {
         return 0;
@@ -555,7 +574,7 @@ void delGenericCommand(client *c, int lazy) {
 }
 
 void delCommand(client *c) {
-    delGenericCommand(c,0);
+    delGenericCommand(c,server.lazyfree_lazy_user_del);
 }
 
 void unlinkCommand(client *c) {
@@ -1553,6 +1572,32 @@ int *georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numk
     return keys;
 }
 
+/* LCS ... [KEYS <key1> <key2>] ... */
+int *lcsGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys)
+{
+    int i;
+    int *keys = getKeysTempBuffer;
+    UNUSED(cmd);
+
+    /* We need to parse the options of the command in order to check for the
+     * "KEYS" argument before the "STRINGS" argument. */
+    for (i = 1; i < argc; i++) {
+        char *arg = argv[i]->ptr;
+        int moreargs = (argc-1) - i;
+
+        if (!strcasecmp(arg, "strings")) {
+            break;
+        } else if (!strcasecmp(arg, "keys") && moreargs >= 2) {
+            keys[0] = i+1;
+            keys[1] = i+2;
+            *numkeys = 2;
+            return keys;
+        }
+    }
+    *numkeys = 0;
+    return keys;
+}
+
 /* Helper function to extract keys from memory command.
  * MEMORY USAGE <key> */
 int *memoryGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
@@ -1620,17 +1665,17 @@ int *xreadGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys)
  * a fast way a key that belongs to a specified hash slot. This is useful
  * while rehashing the cluster and in other conditions when we need to
  * understand if we have keys for a given hash slot. */
-void slotToKeyUpdateKey(robj *key, int add) {
-    unsigned int hashslot = keyHashSlot(key->ptr,sdslen(key->ptr));
+void slotToKeyUpdateKey(sds key, int add) {
+    size_t keylen = sdslen(key);
+    unsigned int hashslot = keyHashSlot(key,keylen);
     unsigned char buf[64];
     unsigned char *indexed = buf;
-    size_t keylen = sdslen(key->ptr);
 
     server.cluster->slots_keys_count[hashslot] += add ? 1 : -1;
     if (keylen+2 > 64) indexed = zmalloc(keylen+2);
     indexed[0] = (hashslot >> 8) & 0xff;
     indexed[1] = hashslot & 0xff;
-    memcpy(indexed+2,key->ptr,keylen);
+    memcpy(indexed+2,key,keylen);
     if (add) {
         raxInsert(server.cluster->slots_to_keys,indexed,keylen+2,NULL,NULL);
     } else {
@@ -1639,11 +1684,11 @@ void slotToKeyUpdateKey(robj *key, int add) {
     if (indexed != buf) zfree(indexed);
 }
 
-void slotToKeyAdd(robj *key) {
+void slotToKeyAdd(sds key) {
     slotToKeyUpdateKey(key,1);
 }
 
-void slotToKeyDel(robj *key) {
+void slotToKeyDel(sds key) {
     slotToKeyUpdateKey(key,0);
 }
 

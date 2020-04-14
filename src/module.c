@@ -2157,7 +2157,7 @@ RedisModuleString *RM_RandomKey(RedisModuleCtx *ctx) {
 int RM_StringSet(RedisModuleKey *key, RedisModuleString *str) {
     if (!(key->mode & REDISMODULE_WRITE) || key->iter) return REDISMODULE_ERR;
     RM_DeleteKey(key);
-    setKey(key->db,key->key,str);
+    genericSetKey(key->db,key->key,str,0,0);
     key->value = str;
     return REDISMODULE_OK;
 }
@@ -2237,7 +2237,7 @@ int RM_StringTruncate(RedisModuleKey *key, size_t newlen) {
     if (key->value == NULL) {
         /* Empty key: create it with the new size. */
         robj *o = createObject(OBJ_STRING,sdsnewlen(NULL, newlen));
-        setKey(key->db,key->key,o);
+        genericSetKey(key->db,key->key,o,0,0);
         key->value = o;
         decrRefCount(o);
     } else {
@@ -3326,13 +3326,8 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
      * a Lua script in the context of AOF and slaves. */
     if (replicate) moduleReplicateMultiIfNeeded(ctx);
 
-    if (ctx->client->flags & CLIENT_MULTI ||
-        ctx->flags & REDISMODULE_CTX_MULTI_EMITTED) {
-        c->flags |= CLIENT_MULTI;
-    }
-
     /* Run the command */
-    int call_flags = CMD_CALL_SLOWLOG | CMD_CALL_STATS;
+    int call_flags = CMD_CALL_SLOWLOG | CMD_CALL_STATS | CMD_CALL_NOWRAP;
     if (replicate) {
         if (!(flags & REDISMODULE_ARGV_NO_AOF))
             call_flags |= CMD_CALL_PROPAGATE_AOF;
@@ -3341,9 +3336,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     }
     call(c,call_flags);
 
-    /* Convert the result of the Redis command into a suitable Lua type.
-     * The first thing we need is to create a single string from the client
-     * output buffers. */
+    /* Convert the result of the Redis command into a module reply. */
     sds proto = sdsnewlen(c->buf,c->bufpos);
     c->bufpos = 0;
     while(listLength(c->reply)) {
@@ -3632,7 +3625,7 @@ int RM_ModuleTypeSetValue(RedisModuleKey *key, moduleType *mt, void *value) {
     if (!(key->mode & REDISMODULE_WRITE) || key->iter) return REDISMODULE_ERR;
     RM_DeleteKey(key);
     robj *o = createModuleObject(mt,value);
-    setKey(key->db,key->key,o);
+    genericSetKey(key->db,key->key,o,0,0);
     decrRefCount(o);
     key->value = o;
     return REDISMODULE_OK;
@@ -4400,14 +4393,17 @@ RedisModuleBlockedClient *moduleBlockClient(RedisModuleCtx *ctx, RedisModuleCmdF
  * can really be unblocked, since the module was able to serve the client.
  * If the callback returns REDISMODULE_OK, then the client can be unblocked,
  * otherwise the client remains blocked and we'll retry again when one of
- * the keys it blocked for becomes "ready" again. */
+ * the keys it blocked for becomes "ready" again.
+ * This function returns 1 if client was served (and should be unblocked) */
 int moduleTryServeClientBlockedOnKey(client *c, robj *key) {
     int served = 0;
     RedisModuleBlockedClient *bc = c->bpop.module_blocked_handle;
+
     /* Protect against re-processing: don't serve clients that are already
      * in the unblocking list for any reason (including RM_UnblockClient()
-     * explicit call). */
-    if (bc->unblocked) return REDISMODULE_ERR;
+     * explicit call). See #6798. */
+    if (bc->unblocked) return 0;
+
     RedisModuleCtx ctx = REDISMODULE_CTX_INIT;
     ctx.flags |= REDISMODULE_CTX_BLOCKED_REPLY;
     ctx.blocked_ready_key = key;
@@ -5982,7 +5978,7 @@ sds modulesCollectInfo(sds info, const char *section, int for_crash_report, int 
         struct RedisModule *module = dictGetVal(de);
         if (!module->info_cb)
             continue;
-        RedisModuleInfoCtx info_ctx = {module, section, info, sections, 0};
+        RedisModuleInfoCtx info_ctx = {module, section, info, sections, 0, 0};
         module->info_cb(&info_ctx, for_crash_report);
         /* Implicitly end dicts (no way to handle errors, and we must add the newline). */
         if (info_ctx.in_dict_field)

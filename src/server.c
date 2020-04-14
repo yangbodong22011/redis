@@ -672,15 +672,15 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,1,1,1,0,0,0},
 
     {"multi",multiCommand,1,
-     "no-script fast @transaction",
+     "no-script fast ok-loading ok-stale @transaction",
      0,NULL,0,0,0,0,0,0},
 
     {"exec",execCommand,1,
-     "no-script no-monitor no-slowlog @transaction",
+     "no-script no-monitor no-slowlog ok-loading ok-stale @transaction",
      0,NULL,0,0,0,0,0,0},
 
     {"discard",discardCommand,1,
-     "no-script fast @transaction",
+     "no-script fast ok-loading ok-stale @transaction",
      0,NULL,0,0,0,0,0,0},
 
     {"sync",syncCommand,1,
@@ -947,11 +947,11 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,1,1,1,0,0,0},
 
     {"xread",xreadCommand,-4,
-     "read-only no-script @stream @blocking",
+     "read-only @stream @blocking",
      0,xreadGetKeys,1,1,1,0,0,0},
 
     {"xreadgroup",xreadCommand,-7,
-     "write no-script @stream @blocking",
+     "write @stream @blocking",
      0,xreadGetKeys,1,1,1,0,0,0},
 
     {"xgroup",xgroupCommand,-2,
@@ -1004,7 +1004,11 @@ struct redisCommand redisCommandTable[] = {
 
     {"acl",aclCommand,-2,
      "admin no-script no-slowlog ok-loading ok-stale",
-     0,NULL,0,0,0,0,0,0}
+     0,NULL,0,0,0,0,0,0},
+
+    {"lcs",lcsCommand,-4,
+     "write use-memory @string",
+     0,lcsGetKeys,0,0,0,0,0,0}
 };
 
 /*============================ Utility functions ============================ */
@@ -1502,42 +1506,6 @@ long long getInstantaneousMetric(int metric) {
     return sum / STATS_METRIC_SAMPLES;
 }
 
-/* Check for timeouts. Returns non-zero if the client was terminated.
- * The function gets the current time in milliseconds as argument since
- * it gets called multiple times in a loop, so calling gettimeofday() for
- * each iteration would be costly without any actual gain. */
-int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
-    time_t now = now_ms/1000;
-
-    if (server.maxidletime &&
-        !(c->flags & CLIENT_SLAVE) &&    /* no timeout for slaves and monitors */
-        !(c->flags & CLIENT_MASTER) &&   /* no timeout for masters */
-        !(c->flags & CLIENT_BLOCKED) &&  /* no timeout for BLPOP */
-        !(c->flags & CLIENT_PUBSUB) &&   /* no timeout for Pub/Sub clients */
-        (now - c->lastinteraction > server.maxidletime))
-    {
-        serverLog(LL_VERBOSE,"Closing idle client");
-        freeClient(c);
-        return 1;
-    } else if (c->flags & CLIENT_BLOCKED) {
-        /* Blocked OPS timeout is handled with milliseconds resolution.
-         * However note that the actual resolution is limited by
-         * server.hz. */
-
-        if (c->bpop.timeout != 0 && c->bpop.timeout < now_ms) {
-            /* Handle blocking operation specific timeout. */
-            replyToBlockedClientTimedOut(c);
-            unblockClient(c);
-        } else if (server.cluster_enabled) {
-            /* Cluster: handle unblock & redirect of clients blocked
-             * into keys no longer served by this server. */
-            if (clusterRedirectBlockedClientIfNeeded(c))
-                unblockClient(c);
-        }
-    }
-    return 0;
-}
-
 /* The client query buffer is an sds.c string that can end with a lot of
  * free space not used, this function reclaims space if needed.
  *
@@ -1625,6 +1593,28 @@ int clientsCronTrackExpansiveClients(client *c) {
     return 0; /* This function never terminates the client. */
 }
 
+/* Iterating all the clients in getMemoryOverheadData() is too slow and
+ * in turn would make the INFO command too slow. So we perform this
+ * computation incrementally and track the (not instantaneous but updated
+ * to the second) total memory used by clients using clinetsCron() in
+ * a more incremental way (depending on server.hz). */
+int clientsCronTrackClientsMemUsage(client *c) {
+    size_t mem = 0;
+    int type = getClientType(c);
+    mem += getClientOutputBufferMemoryUsage(c);
+    mem += sdsAllocSize(c->querybuf);
+    mem += sizeof(client);
+    /* Now that we have the memory used by the client, remove the old
+     * value from the old categoty, and add it back. */
+    server.stat_clients_type_memory[c->client_cron_last_memory_type] -=
+        c->client_cron_last_memory_usage;
+    server.stat_clients_type_memory[type] += mem;
+    /* Remember what we added and where, to remove it next time. */
+    c->client_cron_last_memory_usage = mem;
+    c->client_cron_last_memory_type = type;
+    return 0;
+}
+
 /* Return the max samples in the memory usage of clients tracked by
  * the function clientsCronTrackExpansiveClients(). */
 void getExpansiveClientsInfo(size_t *in_usage, size_t *out_usage) {
@@ -1676,7 +1666,7 @@ void clientsCron(void) {
         /* Rotate the list, take the current head, process.
          * This way if the client must be removed from the list it's the
          * first element and we don't incur into O(N) computation. */
-        listRotate(server.clients);
+        listRotateTailToHead(server.clients);
         head = listFirst(server.clients);
         c = listNodeValue(head);
         /* The following functions do different service checks on the client.
@@ -1685,6 +1675,7 @@ void clientsCron(void) {
         if (clientsCronHandleTimeout(c,now)) continue;
         if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronTrackExpansiveClients(c)) continue;
+        if (clientsCronTrackClientsMemUsage(c)) continue;
     }
 }
 
@@ -2092,11 +2083,15 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* Handle precise timeouts of blocked clients. */
+    handleBlockedClientsTimeout();
+
     /* We should handle pending reads clients ASAP after event loop. */
     handleClientsWithPendingReadsUsingThreads();
 
     /* Handle TLS pending data. (must be done before flushAppendOnlyFile) */
     tlsProcessPendingData();
+
     /* If tls still has pending unread data don't sleep at all. */
     aeSetDontWait(server.el, tlsHasPendingData());
 
@@ -2355,6 +2350,7 @@ void initServerConfig(void) {
     server.repl_syncio_timeout = CONFIG_REPL_SYNCIO_TIMEOUT;
     server.repl_down_since = 0; /* Never connected, repl is down since EVER. */
     server.master_repl_offset = 0;
+    server.master_repl_meaningful_offset = 0;
 
     /* Replication partial resync backlog */
     server.repl_backlog = NULL;
@@ -2692,6 +2688,7 @@ void resetServerStats(void) {
     }
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
+    server.stat_unexpected_error_replies = 0;
     server.aof_delayed_fsync = 0;
 }
 
@@ -2720,6 +2717,7 @@ void initServer(void) {
     server.monitors = listCreate();
     server.clients_pending_write = listCreate();
     server.clients_pending_read = listCreate();
+    server.clients_timeout_table = raxNew();
     server.slaveseldb = -1; /* Force to emit the first SELECT command. */
     server.unblocked_clients = listCreate();
     server.ready_keys = listCreate();
@@ -2786,6 +2784,7 @@ void initServer(void) {
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
+    server.pubsub_patterns_dict = dictCreate(&keylistDictType,NULL);
     listSetFreeMethod(server.pubsub_patterns,freePubsubPattern);
     listSetMatchMethod(server.pubsub_patterns,listMatchPubsubPattern);
     server.cronloops = 0;
@@ -2816,6 +2815,8 @@ void initServer(void) {
     server.stat_rdb_cow_bytes = 0;
     server.stat_aof_cow_bytes = 0;
     server.stat_module_cow_bytes = 0;
+    for (int j = 0; j < CLIENT_TYPE_COUNT; j++)
+        server.stat_clients_type_memory[j] = 0;
     server.cron_malloc_stats.zmalloc_used = 0;
     server.cron_malloc_stats.process_rss = 0;
     server.cron_malloc_stats.allocator_allocated = 0;
@@ -3295,12 +3296,16 @@ void call(client *c, int flags) {
         if (flags & CMD_CALL_PROPAGATE) {
             int multi_emitted = 0;
             /* Wrap the commands in server.also_propagate array,
-             * but don't wrap it if we are already in MULIT context,
-             * in case the nested MULIT/EXEC.
+             * but don't wrap it if we are already in MULTI context,
+             * in case the nested MULTI/EXEC.
              *
              * And if the array contains only one command, no need to
              * wrap it, since the single command is atomic. */
-            if (server.also_propagate.numops > 1 && !(c->flags & CLIENT_MULTI)) {
+            if (server.also_propagate.numops > 1 &&
+                !(c->cmd->flags & CMD_MODULE) &&
+                !(c->flags & CLIENT_MULTI) &&
+                !(flags & CMD_CALL_NOWRAP))
+            {
                 execCommandPropagateMulti(c);
                 multi_emitted = 1;
             }
@@ -3465,6 +3470,13 @@ int processCommand(client *c) {
             addReply(c, shared.oomerr);
             return C_OK;
         }
+
+        /* Save out_of_memory result at script start, otherwise if we check OOM
+         * untill first write within script, memory used by lua stack and
+         * arguments might interfere. */
+        if (c->cmd->proc == evalCommand || c->cmd->proc == evalShaCommand) {
+            server.lua_oom = out_of_memory;
+        }
     }
 
     /* Make sure to use a reasonable amount of memory for client side
@@ -3548,11 +3560,19 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* Lua script too slow? Only allow a limited number of commands. */
+    /* Lua script too slow? Only allow a limited number of commands.
+     * Note that we need to allow the transactions commands, otherwise clients
+     * sending a transaction with pipelining without error checking, may have
+     * the MULTI plus a few initial commands refused, then the timeout
+     * condition resolves, and the bottom-half of the transaction gets
+     * executed, see Github PR #7022. */
     if (server.lua_timedout &&
           c->cmd->proc != authCommand &&
           c->cmd->proc != helloCommand &&
           c->cmd->proc != replconfCommand &&
+          c->cmd->proc != multiCommand &&
+          c->cmd->proc != execCommand &&
+          c->cmd->proc != discardCommand &&
         !(c->cmd->proc == shutdownCommand &&
           c->argc == 2 &&
           tolower(((char*)c->argv[1]->ptr)[0]) == 'n') &&
@@ -3991,11 +4011,13 @@ sds genRedisInfoString(const char *section) {
             "client_recent_max_input_buffer:%zu\r\n"
             "client_recent_max_output_buffer:%zu\r\n"
             "blocked_clients:%d\r\n"
-            "tracking_clients:%d\r\n",
+            "tracking_clients:%d\r\n"
+            "clients_in_timeout_table:%llu\r\n",
             listLength(server.clients)-listLength(server.slaves),
             maxin, maxout,
             server.blocked_clients,
-            server.tracking_clients);
+            server.tracking_clients,
+            (unsigned long long) raxSize(server.clients_timeout_table));
     }
 
     /* Memory */
@@ -4245,7 +4267,8 @@ sds genRedisInfoString(const char *section) {
             "active_defrag_key_hits:%lld\r\n"
             "active_defrag_key_misses:%lld\r\n"
             "tracking_total_keys:%lld\r\n"
-            "tracking_total_items:%lld\r\n",
+            "tracking_total_items:%lld\r\n"
+            "unexpected_error_replies:%lld\r\n",
             server.stat_numconnections,
             server.stat_numcommands,
             getInstantaneousMetric(STATS_METRIC_COMMAND),
@@ -4274,7 +4297,8 @@ sds genRedisInfoString(const char *section) {
             server.stat_active_defrag_key_hits,
             server.stat_active_defrag_key_misses,
             (unsigned long long) trackingGetTotalKeys(),
-            (unsigned long long) trackingGetTotalItems());
+            (unsigned long long) trackingGetTotalItems(),
+            server.stat_unexpected_error_replies);
     }
 
     /* Replication */
@@ -4390,6 +4414,7 @@ sds genRedisInfoString(const char *section) {
             "master_replid:%s\r\n"
             "master_replid2:%s\r\n"
             "master_repl_offset:%lld\r\n"
+            "master_repl_meaningful_offset:%lld\r\n"
             "second_repl_offset:%lld\r\n"
             "repl_backlog_active:%d\r\n"
             "repl_backlog_size:%lld\r\n"
@@ -4398,6 +4423,7 @@ sds genRedisInfoString(const char *section) {
             server.replid,
             server.replid2,
             server.master_repl_offset,
+            server.master_repl_meaningful_offset,
             server.second_replid_offset,
             server.repl_backlog != NULL,
             server.repl_backlog_size,
@@ -4775,6 +4801,7 @@ void loadDataFromDisk(void) {
             {
                 memcpy(server.replid,rsi.repl_id,sizeof(server.replid));
                 server.master_repl_offset = rsi.repl_offset;
+                server.master_repl_meaningful_offset = rsi.repl_offset;
                 /* If we are a slave, create a cached master from this
                  * information, in order to allow partial resynchronizations
                  * with masters. */

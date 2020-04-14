@@ -935,7 +935,6 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
     streamIterator si;
     int64_t numfields;
     streamID id;
-    int propagate_last_id = 0;
 
     /* If the client is asking for some history, we serve it using a
      * different function, so that we return entries *solely* from its
@@ -951,6 +950,8 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
         arraylen_ptr = addReplyDeferredLen(c);
     streamIteratorStart(&si,s,start,end,rev);
     while(streamIteratorGetID(&si,&id,&numfields)) {
+        int propagate_last_id = 0;
+
         /* Update the group last_id if needed. */
         if (group && streamCompareID(&id,&group->last_id) > 0) {
             group->last_id = id;
@@ -962,7 +963,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
         addReplyArrayLen(c,2);
         addReplyStreamID(c,&id);
 
-        addReplyMapLen(c,numfields);
+        addReplyArrayLen(c,numfields*2);
 
         /* Emit the field-value pairs. */
         while(numfields--) {
@@ -1373,6 +1374,11 @@ void xreadCommand(client *c) {
         int moreargs = c->argc-i-1;
         char *o = c->argv[i]->ptr;
         if (!strcasecmp(o,"BLOCK") && moreargs) {
+            if (c->flags & CLIENT_LUA) {
+                /* There is no sense to use BLOCK option within LUA */
+                addReplyErrorFormat(c, "%s command is not allowed with BLOCK option from scripts", (char *)c->argv[0]->ptr);
+                return;
+            }
             i++;
             if (getTimeoutFromObjectOrReply(c,c->argv[i],&timeout,
                 UNIT_MILLISECONDS) != C_OK) return;
@@ -1921,11 +1927,21 @@ void xackCommand(client *c) {
         return;
     }
 
+    /* Start parsing the IDs, so that we abort ASAP if there is a syntax
+     * error: the return value of this command cannot be an error in case
+     * the client successfully acknowledged some messages, so it should be
+     * executed in a "all or nothing" fashion. */
+    for (int j = 3; j < c->argc; j++) {
+        streamID id;
+        if (streamParseStrictIDOrReply(c,c->argv[j],&id,0) != C_OK) return;
+    }
+
     int acknowledged = 0;
     for (int j = 3; j < c->argc; j++) {
         streamID id;
         unsigned char buf[sizeof(streamID)];
-        if (streamParseStrictIDOrReply(c,c->argv[j],&id,0) != C_OK) return;
+        if (streamParseStrictIDOrReply(c,c->argv[j],&id,0) != C_OK)
+            serverPanic("StreamID invalid after check. Should not be possible.");
         streamEncodeID(buf,&id);
 
         /* Lookup the ID in the group PEL: it will have a reference to the

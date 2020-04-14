@@ -93,6 +93,18 @@ start_server {
         assert {[r XACK mystream mygroup $id1 $id2] eq 1}
     }
 
+    test {XACK should fail if got at least one invalid ID} {
+        r del mystream
+        r xgroup create s g $ MKSTREAM
+        r xadd s * f1 v1
+        set c [llength [lindex [r xreadgroup group g c streams s >] 0 1]]
+        assert {$c == 1}
+        set pending [r xpending s g - + 10 c]
+        set id1 [lindex $pending 0 0]
+        assert_error "*Invalid stream ID specified*" {r xack s g $id1 invalid-id}
+        assert {[r xack s g $id1] eq 1}
+    }
+
     test {PEL NACK reassignment after XGROUP SETID event} {
         r del events
         r xadd events * f1 v1
@@ -168,6 +180,27 @@ start_server {
         $rd XREADGROUP GROUP mygroup Alice BLOCK 100 STREAMS mystream ">"
         r XGROUP DESTROY mystream mygroup
         assert_error "*NOGROUP*" {$rd read}
+    }
+
+    test {RENAME can unblock XREADGROUP with data} {
+        r del mystream
+        r XGROUP CREATE mystream mygroup $ MKSTREAM
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP mygroup Alice BLOCK 0 STREAMS mystream ">"
+        r XGROUP CREATE mystream2 mygroup $ MKSTREAM
+        r XADD mystream2 100 f1 v1
+        r RENAME mystream2 mystream
+        assert_equal "{mystream {{100-0 {f1 v1}}}}" [$rd read] ;# mystream2 had mygroup before RENAME
+    }
+
+    test {RENAME can unblock XREADGROUP with -NOGROUP} {
+        r del mystream
+        r XGROUP CREATE mystream mygroup $ MKSTREAM
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP mygroup Alice BLOCK 0 STREAMS mystream ">"
+        r XADD mystream2 100 f1 v1
+        r RENAME mystream2 mystream
+        assert_error "*NOGROUP*" {$rd read} ;# mystream2 didn't have mygroup before RENAME
     }
 
     test {XCLAIM can claim PEL items from another consumer} {
@@ -309,6 +342,19 @@ start_server {
                 set myentry [lindex $item 0 1 0 1]
                 assert {$myentry eq {a 3}}
             }
+        }
+    }
+
+    start_server {tags {"stream"} overrides {appendonly yes aof-use-rdb-preamble no}} {
+        test {Empty stream with no lastid can be rewrite into AOF correctly} {
+            r XGROUP CREATE mystream group-name $ MKSTREAM
+            assert {[dict get [r xinfo stream mystream] length] == 0}
+            set grpinfo [r xinfo groups mystream]
+            r bgrewriteaof
+            waitForBgrewriteaof r
+            r debug loadaof
+            assert {[dict get [r xinfo stream mystream] length] == 0}
+            assert {[r xinfo groups mystream] == $grpinfo}
         }
     }
 }

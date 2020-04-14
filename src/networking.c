@@ -157,6 +157,8 @@ client *createClient(connection *conn) {
     c->client_list_node = NULL;
     c->client_tracking_redirection = 0;
     c->client_tracking_prefixes = NULL;
+    c->client_cron_last_memory_usage = 0;
+    c->client_cron_last_memory_type = CLIENT_TYPE_NORMAL;
     c->auth_callback = NULL;
     c->auth_callback_privdata = NULL;
     c->auth_module = NULL;
@@ -373,13 +375,25 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
      * will produce an error. However it is useful to log such events since
      * they are rare and may hint at errors in a script or a bug in Redis. */
     int ctype = getClientType(c);
-    if (ctype == CLIENT_TYPE_MASTER || ctype == CLIENT_TYPE_SLAVE) {
-        char* to = ctype == CLIENT_TYPE_MASTER? "master": "replica";
-        char* from = ctype == CLIENT_TYPE_MASTER? "replica": "master";
+    if (ctype == CLIENT_TYPE_MASTER || ctype == CLIENT_TYPE_SLAVE || c->id == CLIENT_ID_AOF) {
+        char *to, *from;
+
+        if (c->id == CLIENT_ID_AOF) {
+            to = "AOF-loading-client";
+            from = "server";
+        } else if (ctype == CLIENT_TYPE_MASTER) {
+            to = "master";
+            from = "replica";
+        } else {
+            to = "replica";
+            from = "master";
+        }
+
         char *cmdname = c->lastcmd ? c->lastcmd->name : "<unknown>";
         serverLog(LL_WARNING,"== CRITICAL == This %s is sending an error "
                              "to its %s: '%s' after processing the command "
                              "'%s'", from, to, s, cmdname);
+        server.stat_unexpected_error_replies++;
     }
 }
 
@@ -1147,6 +1161,11 @@ void freeClient(client *c) {
         serverAssert(ln != NULL);
         listDelNode(server.clients_to_close,ln);
     }
+
+    /* Remove the contribution that this client gave to our
+     * incrementally computed memory usage. */
+    server.stat_clients_type_memory[c->client_cron_last_memory_type] -=
+        c->client_cron_last_memory_usage;
 
     /* Release other dynamically allocated client structure fields,
      * and finally release the client structure itself. */
@@ -2310,6 +2329,25 @@ NULL
             {
                 addReplyError(c,
                 "OPTIN and OPTOUT are not compatible with BCAST");
+                zfree(prefix);
+                return;
+            }
+
+            if (options & CLIENT_TRACKING_OPTIN && options & CLIENT_TRACKING_OPTOUT)
+            {
+                addReplyError(c,
+                "You can't specify both OPTIN mode and OPTOUT mode");
+                zfree(prefix);
+                return;
+            }
+
+            if ((options & CLIENT_TRACKING_OPTIN && c->flags & CLIENT_TRACKING_OPTOUT) ||
+                (options & CLIENT_TRACKING_OPTOUT && c->flags & CLIENT_TRACKING_OPTIN))
+            {
+                addReplyError(c,
+                "You can't switch OPTIN/OPTOUT mode before disabling "
+                "tracking for this client, and then re-enabling it with "
+                "a different mode.");
                 zfree(prefix);
                 return;
             }

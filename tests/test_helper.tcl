@@ -47,6 +47,7 @@ set ::all_tests {
     integration/logging
     integration/psync2
     integration/psync2-reg
+    integration/psync2-pingoff
     unit/pubsub
     unit/slowlog
     unit/scripting
@@ -212,11 +213,9 @@ proc test_server_main {} {
     # Start the client instances
     set ::clients_pids {}
     if {$::external} {
-        for {set j 0} {$j < $::numclients} {incr j} {
-            set p [exec $tclsh [info script] {*}$::argv \
-                --client $port --port $::port &]
-            lappend ::clients_pids $p
-        }
+        set p [exec $tclsh [info script] {*}$::argv \
+            --client $port --port $::port &]
+        lappend ::clients_pids $p
     } else {
         set start_port [expr {$::port+100}]
         for {set j 0} {$j < $::numclients} {incr j} {
