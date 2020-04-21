@@ -30,6 +30,7 @@
 #include "server.h"
 #include "sha256.h"
 #include <fcntl.h>
+#include <ctype.h>
 
 /* =============================================================================
  * Global state for ACLs
@@ -168,6 +169,18 @@ sds ACLHashPassword(unsigned char *cleartext, size_t len) {
 /* =============================================================================
  * Low level ACL API
  * ==========================================================================*/
+
+/* Return 1 if the specified string contains spaces or null characters.
+ * We do this for usernames and key patterns for simpler rewriting of
+ * ACL rules, presentation on ACL list, and to avoid subtle security bugs
+ * that may arise from parsing the rules in presence of escapes.
+ * The function returns 0 if the string has no spaces. */
+int ACLStringHasSpaces(const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (isspace(s[i]) || s[i] == 0) return 1;
+    }
+    return 0;
+}
 
 /* Given the category name the command returns the corresponding flag, or
  * zero if there is no match. */
@@ -690,7 +703,8 @@ void ACLAddAllowedSubcommand(user *u, unsigned long id, const char *sub) {
  *
  * When an error is returned, errno is set to the following values:
  *
- * EINVAL: The specified opcode is not understood.
+ * EINVAL: The specified opcode is not understood or the key pattern is
+ *         invalid (contains non allowed characters).
  * ENOENT: The command name or command category provided with + or - is not
  *         known.
  * EBUSY:  The subcommand you want to add is about a command that is currently
@@ -787,6 +801,10 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
     } else if (op[0] == '~') {
         if (u->flags & USER_FLAG_ALLKEYS) {
             errno = EEXIST;
+            return C_ERR;
+        }
+        if (ACLStringHasSpaces(op+1,oplen-1)) {
+            errno = EINVAL;
             return C_ERR;
         }
         sds newpat = sdsnewlen(op+1,oplen-1);
@@ -1164,6 +1182,12 @@ int ACLLoadConfiguredUsers(void) {
     while ((ln = listNext(&li)) != NULL) {
         sds *aclrules = listNodeValue(ln);
         sds username = aclrules[0];
+
+        if (ACLStringHasSpaces(aclrules[0],sdslen(aclrules[0]))) {
+            serverLog(LL_WARNING,"Spaces not allowed in ACL usernames");
+            return C_ERR;
+        }
+
         user *u = ACLCreateUser(username,sdslen(username));
         if (!u) {
             u = ACLGetUserByName(username,sdslen(username));
@@ -1286,6 +1310,14 @@ sds ACLLoadFromFile(const char *filename) {
                      "by the username. ", server.acl_filename,
                      linenum);
             sdsfreesplitres(argv,argc);
+            continue;
+        }
+
+        /* Spaces are not allowed in usernames. */
+        if (ACLStringHasSpaces(argv[1],sdslen(argv[1]))) {
+            errors = sdscatprintf(errors,
+                     "'%s:%d: username '%s' contains invalid characters. ",
+                     server.acl_filename, linenum, argv[1]);
             continue;
         }
 
@@ -1598,6 +1630,13 @@ void aclCommand(client *c) {
     char *sub = c->argv[1]->ptr;
     if (!strcasecmp(sub,"setuser") && c->argc >= 3) {
         sds username = c->argv[2]->ptr;
+        /* Check username validity. */
+        if (ACLStringHasSpaces(username,sdslen(username))) {
+            addReplyErrorFormat(c,
+                "Usernames can't contain spaces or null characters");
+            return;
+        }
+
         /* Create a temporary user to validate and stage all changes against
          * before applying to an existing user or creating a new user. If all
          * arguments are valid the user parameters will all be applied together.
@@ -1783,8 +1822,8 @@ void aclCommand(client *c) {
         long count = 10; /* Number of entries to emit by default. */
 
         /* Parse the only argument that LOG may have: it could be either
-         * the number of entires the user wants to display, or alternatively
-         * the "RESET" command in order to flush the old entires. */
+         * the number of entries the user wants to display, or alternatively
+         * the "RESET" command in order to flush the old entries. */
         if (c->argc == 3) {
             if (!strcasecmp(c->argv[2]->ptr,"reset")) {
                 listSetFreeMethod(ACLLog,ACLFreeLogEntry);

@@ -2444,7 +2444,7 @@ void helloCommand(client *c) {
 
     /* Let's switch to the specified RESP mode. */
     c->resp = ver;
-    addReplyMapLen(c,7);
+    addReplyMapLen(c,6 + !server.sentinel_mode);
 
     addReplyBulkCString(c,"server");
     addReplyBulkCString(c,"redis");
@@ -2460,7 +2460,7 @@ void helloCommand(client *c) {
 
     addReplyBulkCString(c,"mode");
     if (server.sentinel_mode) addReplyBulkCString(c,"sentinel");
-    if (server.cluster_enabled) addReplyBulkCString(c,"cluster");
+    else if (server.cluster_enabled) addReplyBulkCString(c,"cluster");
     else addReplyBulkCString(c,"standalone");
 
     if (!server.sentinel_mode) {
@@ -2821,6 +2821,10 @@ void *IOThreadMain(void *myid) {
     /* The ID is the thread number (from 0 to server.iothreads_num-1), and is
      * used by the thread to just manipulate a single sub-array of clients. */
     long id = (unsigned long)myid;
+    char thdname[16];
+
+    snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
+    redis_set_thread_title(thdname);
 
     while(1) {
         /* Wait for start */
