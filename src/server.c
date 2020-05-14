@@ -1006,8 +1006,8 @@ struct redisCommand redisCommandTable[] = {
      "admin no-script no-slowlog ok-loading ok-stale",
      0,NULL,0,0,0,0,0,0},
 
-    {"lcs",lcsCommand,-4,
-     "write use-memory @string",
+    {"stralgo",stralgoCommand,-2,
+     "read-only @string",
      0,lcsGetKeys,0,0,0,0,0,0}
 };
 
@@ -1219,11 +1219,15 @@ int dictEncObjKeyCompare(void *privdata, const void *key1,
         o2->encoding == OBJ_ENCODING_INT)
             return o1->ptr == o2->ptr;
 
-    o1 = getDecodedObject(o1);
-    o2 = getDecodedObject(o2);
+    /* Due to OBJ_STATIC_REFCOUNT, we avoid calling getDecodedObject() without
+     * good reasons, because it would incrRefCount() the object, which
+     * is invalid. So we check to make sure dictFind() works with static
+     * objects as well. */
+    if (o1->refcount != OBJ_STATIC_REFCOUNT) o1 = getDecodedObject(o1);
+    if (o2->refcount != OBJ_STATIC_REFCOUNT) o2 = getDecodedObject(o2);
     cmp = dictSdsKeyCompare(privdata,o1->ptr,o2->ptr);
-    decrRefCount(o1);
-    decrRefCount(o2);
+    if (o1->refcount != OBJ_STATIC_REFCOUNT) decrRefCount(o1);
+    if (o2->refcount != OBJ_STATIC_REFCOUNT) decrRefCount(o2);
     return cmp;
 }
 
@@ -2106,21 +2110,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (server.active_expire_enabled && server.masterhost == NULL)
         activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
 
-    /* Send all the slaves an ACK request if at least one client blocked
-     * during the previous event loop iteration. */
-    if (server.get_ack_from_slaves) {
-        robj *argv[3];
-
-        argv[0] = createStringObject("REPLCONF",8);
-        argv[1] = createStringObject("GETACK",6);
-        argv[2] = createStringObject("*",1); /* Not used argument. */
-        replicationFeedSlaves(server.slaves, server.slaveseldb, argv, 3);
-        decrRefCount(argv[0]);
-        decrRefCount(argv[1]);
-        decrRefCount(argv[2]);
-        server.get_ack_from_slaves = 0;
-    }
-
     /* Unblock all the clients blocked for synchronous replication
      * in WAIT. */
     if (listLength(server.clients_waiting_acks))
@@ -2133,6 +2122,24 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Try to process pending commands for clients that were just unblocked. */
     if (listLength(server.unblocked_clients))
         processUnblockedClients();
+
+    /* Send all the slaves an ACK request if at least one client blocked
+     * during the previous event loop iteration. Note that we do this after
+     * processUnblockedClients(), so if there are multiple pipelined WAITs
+     * and the just unblocked WAIT gets blocked again, we don't have to wait
+     * a server cron cycle in absence of other event loop events. See #6623. */
+    if (server.get_ack_from_slaves) {
+        robj *argv[3];
+
+        argv[0] = createStringObject("REPLCONF",8);
+        argv[1] = createStringObject("GETACK",6);
+        argv[2] = createStringObject("*",1); /* Not used argument. */
+        replicationFeedSlaves(server.slaves, server.slaveseldb, argv, 3);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[1]);
+        decrRefCount(argv[2]);
+        server.get_ack_from_slaves = 0;
+    }
 
     /* Send the invalidation messages to clients participating to the
      * client side caching protocol in broadcasting (BCAST) mode. */
@@ -3197,8 +3204,8 @@ void call(client *c, int flags) {
 
     server.fixed_time_expire++;
 
-    /* Sent the command to clients in MONITOR mode, only if the commands are
-     * not generated from reading an AOF. */
+    /* Send the command to clients in MONITOR mode if applicable.
+     * Administrative commands are considered too dangerous to be shown. */
     if (listLength(server.monitors) &&
         !server.loading &&
         !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN)))
@@ -4037,7 +4044,7 @@ sds genRedisInfoString(const char *section) {
         size_t zmalloc_used = zmalloc_used_memory();
         size_t total_system_mem = server.system_memory_size;
         const char *evict_policy = evictPolicyToString();
-        long long memory_lua = (long long)lua_gc(server.lua,LUA_GCCOUNT,0)*1024;
+        long long memory_lua = server.lua ? (long long)lua_gc(server.lua,LUA_GCCOUNT,0)*1024 : 0;
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
         /* Peak memory is updated from time to time by serverCron() so it
@@ -4273,6 +4280,7 @@ sds genRedisInfoString(const char *section) {
             "active_defrag_key_misses:%lld\r\n"
             "tracking_total_keys:%lld\r\n"
             "tracking_total_items:%lld\r\n"
+            "tracking_total_prefixes:%lld\r\n"
             "unexpected_error_replies:%lld\r\n",
             server.stat_numconnections,
             server.stat_numcommands,
@@ -4303,6 +4311,7 @@ sds genRedisInfoString(const char *section) {
             server.stat_active_defrag_key_misses,
             (unsigned long long) trackingGetTotalKeys(),
             (unsigned long long) trackingGetTotalItems(),
+            (unsigned long long) trackingGetTotalPrefixes(),
             server.stat_unexpected_error_replies);
     }
 
@@ -4842,6 +4851,14 @@ void redisSetProcTitle(char *title) {
 #endif
 }
 
+void redisSetCpuAffinity(const char *cpulist) {
+#ifdef USE_SETCPUAFFINITY
+    setcpuaffinity(cpulist);
+#else
+    UNUSED(cpulist);
+#endif
+}
+
 /*
  * Check whether systemd or upstart have been used to start redis.
  */
@@ -4945,6 +4962,7 @@ int main(int argc, char **argv) {
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     srand(time(NULL)^getpid());
     gettimeofday(&tv,NULL);
+    crc64_init();
 
     uint8_t hashseed[16];
     getRandomBytes(hashseed,sizeof(hashseed));
@@ -5110,6 +5128,7 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING,"WARNING: You specified a maxmemory value that is less than 1MB (current value is %llu bytes). Are you sure this is what you really want?", server.maxmemory);
     }
 
+    redisSetCpuAffinity(server.server_cpulist);
     aeSetBeforeSleepProc(server.el,beforeSleep);
     aeSetAfterSleepProc(server.el,afterSleep);
     aeMain(server.el);
