@@ -15,7 +15,7 @@ set (REDIS_SERVER_SRC
         rand.c rax.c rdb.c redis-check-aof.c redis-check-rdb.c
         release.c replication.c rio.c scripting.c sds.c sentinel.c server.c setproctitle.c sha1.c
         sha256.c siphash.c slowlog.c sort.c sparkline.c syncio.c t_hash.c t_list.c t_set.c t_stream.c t_string.c
-        t_zset.c tls.c tracking.c util.c ziplist.c zipmap.c zmalloc.c endianconv.c timeout.c)
+        t_zset.c tls.c tracking.c util.c ziplist.c zipmap.c zmalloc.c endianconv.c timeout.c crcspeed.c)
 
 include_directories(redis-server
         ${REDIS_ROOT}/src

@@ -33,3 +33,7 @@ deps/lua/src/liblua.a
 Makefile.dep
 .vscode/*
 .idea/*
+.DS_Store
+cmake-build-debug/
+modules/libhiredis.a
+modules/liblua.a
