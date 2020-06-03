@@ -166,6 +166,25 @@ sds ACLHashPassword(unsigned char *cleartext, size_t len) {
     return sdsnewlen(hex,HASH_PASSWORD_LEN);
 }
 
+/* Given a hash and the hash length, returns C_OK if it is a valid password 
+ * hash, or C_ERR otherwise. */
+int ACLCheckPasswordHash(unsigned char *hash, int hashlen) {
+    if (hashlen != HASH_PASSWORD_LEN) {
+        return C_ERR;      
+    }
+ 
+    /* Password hashes can only be characters that represent
+     * hexadecimal values, which are numbers and lowercase 
+     * characters 'a' through 'f'. */
+    for(int i = 0; i < HASH_PASSWORD_LEN; i++) {
+        char c = hash[i];
+        if ((c < 'a' || c > 'f') && (c < '0' || c > '9')) {
+            return C_ERR;
+        }
+    }
+    return C_OK;
+}
+
 /* =============================================================================
  * Low level ACL API
  * ==========================================================================*/
@@ -356,12 +375,13 @@ int ACLUserCanExecuteFutureCommands(user *u) {
  * to skip the command bit explicit test. */
 void ACLSetUserCommandBit(user *u, unsigned long id, int value) {
     uint64_t word, bit;
-    if (value == 0) u->flags &= ~USER_FLAG_ALLCOMMANDS;
     if (ACLGetCommandBitCoordinates(id,&word,&bit) == C_ERR) return;
-    if (value)
+    if (value) {
         u->allowed_commands[word] |= bit;
-    else
+    } else {
         u->allowed_commands[word] &= ~bit;
+        u->flags &= ~USER_FLAG_ALLCOMMANDS;
+    }
 }
 
 /* This is like ACLSetUserCommandBit(), but instead of setting the specified
@@ -712,10 +732,11 @@ void ACLAddAllowedSubcommand(user *u, unsigned long id, const char *sub) {
  * EEXIST: You are adding a key pattern after "*" was already added. This is
  *         almost surely an error on the user side.
  * ENODEV: The password you are trying to remove from the user does not exist.
- * EBADMSG: The hash you are trying to add is not a valid hash. 
+ * EBADMSG: The hash you are trying to add is not a valid hash.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
     if (oplen == -1) oplen = strlen(op);
+    if (oplen == 0) return C_OK; /* Empty string is a no-operation. */
     if (!strcasecmp(op,"on")) {
         u->flags |= USER_FLAG_ENABLED;
         u->flags &= ~USER_FLAG_DISABLED;
@@ -753,21 +774,9 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         if (op[0] == '>') {
             newpass = ACLHashPassword((unsigned char*)op+1,oplen-1);
         } else {
-            if (oplen != HASH_PASSWORD_LEN + 1) {
+            if (ACLCheckPasswordHash((unsigned char*)op+1,oplen-1) == C_ERR) {
                 errno = EBADMSG;
                 return C_ERR;
-            }
-
-            /* Password hashes can only be characters that represent
-             * hexadecimal values, which are numbers and lowercase
-             * characters 'a' through 'f'.
-             */
-            for(int i = 1; i < HASH_PASSWORD_LEN + 1; i++) {
-                char c = op[i];
-                if ((c < 'a' || c > 'f') && (c < '0' || c > '9')) {
-                    errno = EBADMSG;
-                    return C_ERR;
-                }
             }
             newpass = sdsnewlen(op+1,oplen-1);
         }
@@ -784,7 +793,7 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         if (op[0] == '<') {
             delpass = ACLHashPassword((unsigned char*)op+1,oplen-1);
         } else {
-            if (oplen != HASH_PASSWORD_LEN + 1) {
+            if (ACLCheckPasswordHash((unsigned char*)op+1,oplen-1) == C_ERR) {
                 errno = EBADMSG;
                 return C_ERR;
             }
@@ -838,7 +847,6 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
                 errno = ENOENT;
                 return C_ERR;
             }
-            unsigned long id = ACLGetCommandID(copy);
 
             /* The subcommand cannot be empty, so things like DEBUG|
              * are syntax errors of course. */
@@ -851,6 +859,7 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
             /* The command should not be set right now in the command
              * bitmap, because adding a subcommand of a fully added
              * command is probably an error on the user side. */
+            unsigned long id = ACLGetCommandID(copy);
             if (ACLGetUserCommandBit(u,id) == 1) {
                 zfree(copy);
                 errno = EBUSY;
@@ -1289,7 +1298,7 @@ sds ACLLoadFromFile(const char *filename) {
         if (lines[i][0] == '\0') continue;
 
         /* Split into arguments */
-        argv = sdssplitargs(lines[i],&argc);
+        argv = sdssplitlen(lines[i],sdslen(lines[i])," ",1,&argc);
         if (argv == NULL) {
             errors = sdscatprintf(errors,
                      "%s:%d: unbalanced quotes in acl line. ",
@@ -1321,11 +1330,14 @@ sds ACLLoadFromFile(const char *filename) {
             continue;
         }
 
-        /* Try to process the line using the fake user to validate iif
-         * the rules are able to apply cleanly. */
+        /* Try to process the line using the fake user to validate if
+         * the rules are able to apply cleanly. At this stage we also
+         * trim trailing spaces, so that we don't have to handle that
+         * in ACLSetUser(). */
         ACLSetUser(fakeuser,"reset",-1);
         int j;
         for (j = 2; j < argc; j++) {
+            argv[j] = sdstrim(argv[j],"\t\r\n");
             if (ACLSetUser(fakeuser,argv[j],sdslen(argv[j])) != C_OK) {
                 char *errmsg = ACLSetUserStringError();
                 errors = sdscatprintf(errors,

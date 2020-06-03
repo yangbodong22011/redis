@@ -133,6 +133,12 @@ void setproctitle(const char *fmt, ...);
 /* Byte ordering detection */
 #include <sys/types.h> /* This will likely define BYTE_ORDER */
 
+/* Define redis_sendfile. */
+#if defined(__linux__) || (defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_5))
+#define HAVE_SENDFILE 1
+ssize_t redis_sendfile(int out_fd, int in_fd, off_t offset, size_t count);
+#endif
+
 #ifndef BYTE_ORDER
 #if (BSD >= 199103)
 # include <machine/endian.h>
@@ -248,7 +254,7 @@ int pthread_setname_np(const char *name);
 #endif
 
 /* Check if we can use setcpuaffinity(). */
-#if (defined __linux || defined __NetBSD__ || defined __FreeBSD__ || defined __OpenBSD__)
+#if (defined __linux || defined __NetBSD__ || defined __FreeBSD__)
 #define USE_SETCPUAFFINITY
 void setcpuaffinity(const char *cpulist);
 #endif

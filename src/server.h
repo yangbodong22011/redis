@@ -255,6 +255,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CLIENT_TRACKING_NOLOOP (1ULL<<37) /* Don't send invalidation messages
                                              about writes performed by myself.*/
 #define CLIENT_IN_TO_TABLE (1ULL<<38) /* This client is in the timeout table. */
+#define CLIENT_PROTOCOL_ERROR (1ULL<<39) /* Protocol error chatting with it. */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -1095,6 +1096,7 @@ struct redisServer {
                                    queries. Will still serve RESP2 queries. */
     int io_threads_num;         /* Number of IO threads to use. */
     int io_threads_do_reads;    /* Read and parse from IO threads? */
+    long long events_processed_while_blocked; /* processEventsWhileBlocked() */
 
     /* RDB / AOF loading information */
     int loading;                /* We are loading data from disk if true */
@@ -1259,7 +1261,6 @@ struct redisServer {
     char replid[CONFIG_RUN_ID_SIZE+1];  /* My current replication ID. */
     char replid2[CONFIG_RUN_ID_SIZE+1]; /* replid inherited from master*/
     long long master_repl_offset;   /* My current replication offset */
-    long long master_repl_meaningful_offset; /* Offset minus latest PINGs. */
     long long second_replid_offset; /* Accept offsets up to this for replid2. */
     int slaveseldb;                 /* Last SELECTed DB in replication output */
     int repl_ping_slave_period;     /* Master pings the slave every N seconds */
@@ -1652,7 +1653,7 @@ void rewriteClientCommandVector(client *c, int argc, ...);
 void rewriteClientCommandArgument(client *c, int i, robj *newval);
 void replaceClientCommandVector(client *c, int argc, robj **argv);
 unsigned long getClientOutputBufferMemoryUsage(client *c);
-void freeClientsInAsyncFreeQueue(void);
+int freeClientsInAsyncFreeQueue(void);
 void asyncCloseClientOnOutputBufferLimitReached(client *c);
 int getClientType(client *c);
 int getClientTypeByName(char *name);
@@ -1662,7 +1663,7 @@ void disconnectSlaves(void);
 int listenToPort(int port, int *fds, int *count);
 void pauseClients(mstime_t duration);
 int clientsArePaused(void);
-int processEventsWhileBlocked(void);
+void processEventsWhileBlocked(void);
 int handleClientsWithPendingWrites(void);
 int handleClientsWithPendingWritesUsingThreads(void);
 int handleClientsWithPendingReadsUsingThreads(void);
@@ -1809,6 +1810,7 @@ void clearReplicationId2(void);
 void chopReplicationBacklog(void);
 void replicationCacheMasterUsingMyself(void);
 void feedReplicationBacklog(void *ptr, size_t len);
+void showLatestBacklog(void);
 void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask);
 void rdbPipeWriteHandlerConnRemoved(struct connection *conn);
 
