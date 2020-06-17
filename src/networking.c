@@ -892,17 +892,24 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
     client *c;
     UNUSED(ip);
 
-    /* Admission control will happen before a client is created and connAccept()
+    /* Limit the number of connections we take at the same time.
+     *
+     * Admission control will happen before a client is created and connAccept()
      * called, because we don't want to even start transport-level negotiation
-     * if rejected.
-     */
-    if (listLength(server.clients) >= server.maxclients) {
-        char *err = "-ERR max number of clients reached\r\n";
+     * if rejected. */
+    if (listLength(server.clients) + getClusterConnectionsCount()
+        >= server.maxclients)
+    {
+        char *err;
+        if (server.cluster_enabled)
+            err = "-ERR max number of clients reached\r\n";
+        else
+            err = "-ERR max number of clients + cluster "
+                  "connections reached\r\n";
 
         /* That's a best effort error message, don't check write errors.
-         * Note that for TLS connections, no handshake was done yet so nothing is written
-         * and the connection will just drop.
-         */
+         * Note that for TLS connections, no handshake was done yet so nothing
+         * is written and the connection will just drop. */
         if (connWrite(conn,err,strlen(err)) == -1) {
             /* Nothing to do, Just to avoid the warning... */
         }
@@ -1019,7 +1026,6 @@ void disconnectSlaves(void) {
     listNode *ln;
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
-        listNode *ln = listFirst(server.slaves);
         freeClient((client*)ln->value);
     }
 }
@@ -1239,14 +1245,20 @@ void freeClientAsync(client *c) {
 /* Free the clietns marked as CLOSE_ASAP, return the number of clients
  * freed. */
 int freeClientsInAsyncFreeQueue(void) {
-    int freed = listLength(server.clients_to_close);
-    while (listLength(server.clients_to_close)) {
-        listNode *ln = listFirst(server.clients_to_close);
+    int freed = 0;
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.clients_to_close,&li);
+    while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
+
+        if (c->flags & CLIENT_PROTECTED) continue;
 
         c->flags &= ~CLIENT_CLOSE_ASAP;
         freeClient(c);
         listDelNode(server.clients_to_close,ln);
+        freed++;
     }
     return freed;
 }
@@ -2522,7 +2534,7 @@ void helloCommand(client *c) {
     addReplyBulkCString(c,REDIS_VERSION);
 
     addReplyBulkCString(c,"proto");
-    addReplyLongLong(c,3);
+    addReplyLongLong(c,ver);
 
     addReplyBulkCString(c,"id");
     addReplyLongLong(c,c->id);
