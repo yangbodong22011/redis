@@ -41,6 +41,9 @@ size_t lazyfreeGetFreeEffort(robj *obj) {
     } else if (obj->type == OBJ_HASH && obj->encoding == OBJ_ENCODING_HT) {
         dict *ht = obj->ptr;
         return dictSize(ht);
+    } else if (obj->type == OBJ_STREAM && obj->encoding == OBJ_ENCODING_STREAM) {
+        stream *s = obj->ptr;
+        return s->rax->numnodes + s->cgroups->numnodes;
     } else {
         return 1; /* Everything else is a single allocation. */
     }
